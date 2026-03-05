@@ -13,6 +13,7 @@ import re
 from datetime import datetime
 from urllib.parse import urljoin, unquote
 from dotenv import load_dotenv
+from storage import upload_images
 
 load_dotenv()
 
@@ -112,7 +113,9 @@ def parse_ad_page(url):
         data["seller_type"] = seller.get("@type", "")
 
         images = json_ld.get("image", [])
-        data["images"] = images if isinstance(images, list) else [images]
+        if not isinstance(images, list):
+            images = [images]
+        data["images"] = upload_images("mubawab", data["ad_id"], images)
     else:
         data.update(parse_from_html(soup))
 
@@ -193,11 +196,12 @@ def parse_from_html(soup):
         if p_tag:
             data["description"] = p_tag.get_text(separator="\n", strip=True)
 
-    data["images"] = []
+    raw_images = []
     for img in soup.select(".picturesGallery img"):
         src = img.get("src", "")
         if src and "mubawab-media" in src:
-            data["images"].append(src)
+            raw_images.append(src)
+    data["images"] = upload_images("mubawab", data["ad_id"], raw_images)
 
     return data
 
