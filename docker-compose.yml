@@ -8,9 +8,6 @@ services:
       - MONGO_MUBAWAB_DB=${MONGO_MUBAWAB_DB:-mubawab}
       - MONGO_MUBAWAB_COL=${MONGO_MUBAWAB_COL:-locations}
       - MONGO_MUBAWAB_COL_CLEAN=${MONGO_MUBAWAB_COL_CLEAN:-locations_clean}
-      - POSTGRES_DSN=${POSTGRES_DSN}
-      - PG_TABLE_MUBAWAB=${PG_TABLE_MUBAWAB:-mubawab_listings}
-      - PG_ARCHIVE_MUBAWAB=${PG_ARCHIVE_MUBAWAB:-mubawab_archive}
       - BATCH_SIZE=${BATCH_SIZE:-500}
       - CYCLE_SLEEP=${CYCLE_SLEEP:-86400}
       - B2_KEY_ID=${B2_KEY_ID}
