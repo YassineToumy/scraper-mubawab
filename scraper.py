@@ -1,144 +1,136 @@
 """
-Mubawab.tn Scraper - Annonces de location (appartements & maisons)
-Stockage dans MongoDB — config via .env
+Mubawab.tn Scraper — Locations FR + AR, tous types sauf terrains
 """
 
 import os
-import requests
-from bs4 import BeautifulSoup
-from pymongo import MongoClient
+import re
 import json
 import time
-import re
-from datetime import datetime
-from urllib.parse import urljoin, unquote
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
-from storage import upload_images
+from storage import upload_images, check_b2
 
 load_dotenv()
 
-# ─── Configuration — from .env ───────────────────────────────────
-MONGO_URI = os.environ["MONGODB_URI"]
-DB_NAME = os.getenv("MONGO_MUBAWAB_DB", "mubawab")
-COLLECTION_NAME = os.getenv("MONGO_MUBAWAB_COL", "locations")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("mubawab")
+
+MONGO_URI        = os.environ["MONGODB_URI"]
+DB_NAME          = os.getenv("MONGO_MUBAWAB_DB",  "mubawab")
+COLLECTION_NAME  = os.getenv("MONGO_MUBAWAB_COL", "locations")
 
 BASE_URL = "https://www.mubawab.tn"
-LISTING_URL = "https://www.mubawab.tn/fr/cc/immobilier-a-louer-all:emr:2:sc:apartment-rent,house-rent"
 
-HEADERS = {
+# ─── Property types (no terrains/land) ────────────────────────────
+# (name, fr_search_url, ar_search_url)
+ZONES = [
+    ("Appartements",
+     "https://www.mubawab.tn/fr/sc/appartements-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D8%B4%D9%82%D9%82-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Maisons",
+     "https://www.mubawab.tn/fr/sc/maisons-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D9%85%D9%86%D8%A7%D8%B2%D9%84-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Villas",
+     "https://www.mubawab.tn/fr/sc/villas-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D9%81%D9%8A%D9%84%D8%A7%D8%AA-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Chambres",
+     "https://www.mubawab.tn/fr/sc/chambres-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D8%BA%D8%B1%D9%81-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Locaux commerciaux",
+     "https://www.mubawab.tn/fr/sc/locaux-commerciaux-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D9%85%D8%AD%D9%84%D8%A7%D8%AA-%D8%AA%D8%AC%D8%A7%D8%B1%D9%8A%D8%A9-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Bureaux",
+     "https://www.mubawab.tn/fr/sc/bureaux-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D9%85%D9%83%D8%A7%D8%AA%D8%A8-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Fermes",
+     "https://www.mubawab.tn/fr/sc/fermes-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D8%B6%D9%8A%D8%B9%D8%A7%D8%AA-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+    ("Immobilier divers",
+     "https://www.mubawab.tn/fr/sc/immobilier-divers-a-louer",
+     "https://www.mubawab.tn/ar/sc/%D8%B9%D9%82%D8%A7%D8%B1%D8%A7%D8%AA-%D9%85%D8%AA%D9%86%D9%88%D8%B9%D8%A9-%D9%84%D9%84%D8%A5%D9%8A%D8%AC%D8%A7%D8%B1"),
+]
+
+HEADERS_FR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "fr-FR,fr;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+HEADERS_AR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ar-TN,ar;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
-DELAY_BETWEEN_REQUESTS = 2
-MAX_PAGES = 150
+DELAY     = int(os.getenv("DELAY_BETWEEN_REQUESTS", "2"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "300"))
 
 
-# ─── MongoDB ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# MONGODB
+# ══════════════════════════════════════════════════════════════════
+
 def get_collection():
     client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    col = db[COLLECTION_NAME]
+    col = client[DB_NAME][COLLECTION_NAME]
     col.create_index("ad_id", unique=True)
     return col
 
 
-# ─── Extraction des liens d'annonces depuis la page listing ─────
-def get_ad_links_from_listing(page_url):
-    resp = requests.get(page_url, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+# ══════════════════════════════════════════════════════════════════
+# LINK DISCOVERY
+# ══════════════════════════════════════════════════════════════════
 
-    links = set()
-
-    for box in soup.select(".listingBox[linkRef]"):
-        href = box.get("linkRef", "")
-        if "/fr/pa/" in href or "/fr/a/" in href:
-            full_url = urljoin(BASE_URL, href)
-            links.add(full_url)
-
-    if not links:
-        for a_tag in soup.select("a[href]"):
-            href = a_tag.get("href", "")
-            if "/fr/pa/" in href or "/fr/a/" in href:
-                full_url = urljoin(BASE_URL, href)
-                if re.search(r"/fr/(pa|a)/\d+/", full_url):
-                    links.add(full_url)
-
-    return list(links)
+def extract_id_from_url(url):
+    m = re.search(r"/(?:pa|a)/(\d+)/", url)
+    return m.group(1) if m else None
 
 
 def get_page_url(base_url, page_num):
-    if page_num <= 1:
-        return base_url
-    return f"{base_url}:p:{page_num}"
+    return base_url if page_num <= 1 else f"{base_url}:p:{page_num}"
 
 
-# ─── Extraction des données d'une annonce ────────────────────────
-def parse_ad_page(url):
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+def get_ids_from_page(session, page_url, lang="fr"):
+    """Return set of ad_ids and dicts {id: fr_url}, {id: ar_url} found on a search result page."""
+    headers = HEADERS_FR if lang == "fr" else HEADERS_AR
+    resp = session.get(page_url, headers=headers, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
-    data = {}
 
-    ad_id_input = soup.find("input", {"id": "adId"})
-    data["ad_id"] = ad_id_input["value"] if ad_id_input else extract_id_from_url(url)
-    data["url"] = url
+    ids, fr_urls, ar_urls = set(), {}, {}
 
-    json_ld = extract_json_ld(soup)
-    if json_ld:
-        data["title"] = json_ld.get("name", "")
-        data["description"] = json_ld.get("description", "")
+    def register(href):
+        m = re.search(r"/(fr|ar)/(pa|a)/(\d+)/", href)
+        if not m:
+            return
+        lang_found, _, ad_id = m.group(1), m.group(2), m.group(3)
+        ids.add(ad_id)
+        full = urljoin(BASE_URL, href)
+        if lang_found == "fr":
+            fr_urls[ad_id] = full
+        else:
+            ar_urls[ad_id] = full
 
-        offers = json_ld.get("offers", {})
-        data["price"] = offers.get("price")
-        data["currency"] = offers.get("priceCurrency", "TND")
+    for box in soup.select(".listingBox[linkRef]"):
+        register(box.get("linkRef", ""))
 
-        item = json_ld.get("itemOffered", {})
-        data["rooms"] = item.get("numberOfRooms")
-        data["bedrooms"] = item.get("numberOfBedrooms")
-        data["bathrooms"] = item.get("numberOfBathroomsTotal")
+    if not ids:
+        for a in soup.select("a[href]"):
+            register(a.get("href", ""))
 
-        floor_size = item.get("floorSize", {})
-        data["area_m2"] = floor_size.get("value")
+    return ids, fr_urls, ar_urls
 
-        address = item.get("address", {})
-        data["city"] = address.get("addressLocality", "")
-        data["country"] = address.get("addressCountry", "")
 
-        seller = json_ld.get("seller", {})
-        data["seller_name"] = seller.get("name", "")
-        data["seller_type"] = seller.get("@type", "")
-
-        images = json_ld.get("image", [])
-        if not isinstance(images, list):
-            images = [images]
-        data["images"] = upload_images("mubawab", data["ad_id"], images)
-    else:
-        data.update(parse_from_html(soup))
-
-    location_tag = soup.find("h3", class_="greyTit")
-    if location_tag:
-        data["location_text"] = location_tag.get_text(strip=True)
-
-    lat_input = soup.find("input", {"id": "latField"})
-    lng_input = soup.find("input", {"id": "lngField"})
-    if lat_input and lng_input:
-        try:
-            data["latitude"] = float(lat_input["value"])
-            data["longitude"] = float(lng_input["value"])
-        except (ValueError, KeyError):
-            pass
-
-    data["features"] = extract_features(soup)
-    data["main_features"] = extract_main_features(soup)
-    data["property_type"] = extract_property_type(soup)
-    data["scraped_at"] = datetime.utcnow()
-
-    return data
-
+# ══════════════════════════════════════════════════════════════════
+# DETAIL PAGE PARSING
+# ══════════════════════════════════════════════════════════════════
 
 def extract_json_ld(soup):
     for script in soup.find_all("script", {"type": "application/ld+json"}):
@@ -151,167 +143,342 @@ def extract_json_ld(soup):
     return None
 
 
-def extract_id_from_url(url):
-    m = re.search(r"/(?:pa|a)/(\d+)/", url)
-    return m.group(1) if m else None
+def parse_detail_page(soup):
+    """Parse one detail page (FR or AR). Returns a dict."""
+    d = {}
 
+    ld = extract_json_ld(soup)
+    if ld:
+        d["title"]       = ld.get("name", "")
+        d["description"] = ld.get("description", "")
 
-def parse_from_html(soup):
-    data = {}
+        offers = ld.get("offers", {})
+        d["price"]    = offers.get("price")
+        d["currency"] = offers.get("priceCurrency", "TND")
 
-    h1 = soup.find("h1", class_="searchTitle")
-    data["title"] = h1.get_text(strip=True) if h1 else ""
+        item = ld.get("itemOffered", {})
+        d["rooms"]     = item.get("numberOfRooms")
+        d["bedrooms"]  = item.get("numberOfBedrooms")
+        d["bathrooms"] = item.get("numberOfBathroomsTotal")
+        fs = item.get("floorSize", {})
+        d["area_m2"]   = fs.get("value")
+        addr = item.get("address", {})
+        d["city"]    = addr.get("addressLocality", "")
+        d["country"] = addr.get("addressCountry", "")
 
-    price_tag = soup.find("h3", class_="orangeTit")
-    if price_tag:
-        price_text = price_tag.get_text(strip=True)
-        m = re.search(r"([\d\s]+)", price_text.replace("\xa0", " "))
-        if m:
-            data["price"] = float(m.group(1).replace(" ", ""))
-    data["currency"] = "TND"
+        seller = ld.get("seller", {})
+        d["seller_name"] = seller.get("name", "")
+        d["seller_type"] = seller.get("@type", "")
+        d["phone_ld"]    = seller.get("telephone")  # might be present
 
-    details = soup.select(".adDetailFeature span")
-    for detail in details:
-        txt = detail.get_text(strip=True)
-        if "m²" in txt:
-            m = re.search(r"(\d+)", txt)
+        imgs = ld.get("image", [])
+        d["raw_images"] = imgs if isinstance(imgs, list) else [imgs]
+
+    else:
+        # HTML fallback
+        h1 = soup.find("h1", class_="searchTitle")
+        d["title"] = h1.get_text(strip=True) if h1 else ""
+
+        price_tag = soup.find("h3", class_="orangeTit")
+        if price_tag:
+            txt = price_tag.get_text(strip=True).replace("\xa0", " ")
+            m = re.search(r"([\d\s]+)", txt)
             if m:
-                data["area_m2"] = int(m.group(1))
-        elif "Pièce" in txt:
-            m = re.search(r"(\d+)", txt)
-            if m:
-                data["rooms"] = int(m.group(1))
-        elif "Chambre" in txt:
-            m = re.search(r"(\d+)", txt)
-            if m:
-                data["bedrooms"] = int(m.group(1))
-        elif "Salle de bain" in txt:
-            m = re.search(r"(\d+)", txt)
-            if m:
-                data["bathrooms"] = int(m.group(1))
+                d["price"] = float(m.group(1).replace(" ", ""))
+        d["currency"] = "TND"
 
-    desc_block = soup.find("div", class_="blockProp")
-    if desc_block:
-        p_tag = desc_block.find("p")
-        if p_tag:
-            data["description"] = p_tag.get_text(separator="\n", strip=True)
+        for span in soup.select(".adDetailFeature span"):
+            txt = span.get_text(strip=True)
+            if "m²" in txt:
+                m = re.search(r"(\d+)", txt)
+                if m: d["area_m2"] = int(m.group(1))
+            elif re.search(r"Pièce|غرفة", txt):
+                m = re.search(r"(\d+)", txt)
+                if m: d["rooms"] = int(m.group(1))
+            elif re.search(r"Chambre|غرفة نوم", txt):
+                m = re.search(r"(\d+)", txt)
+                if m: d["bedrooms"] = int(m.group(1))
+            elif re.search(r"bain|حمام", txt, re.I):
+                m = re.search(r"(\d+)", txt)
+                if m: d["bathrooms"] = int(m.group(1))
 
-    raw_images = []
-    for img in soup.select(".picturesGallery img"):
-        src = img.get("src", "")
-        if src and "mubawab-media" in src:
-            raw_images.append(src)
-    data["images"] = upload_images("mubawab", data["ad_id"], raw_images)
+        desc = soup.find("div", class_="blockProp")
+        if desc:
+            p = desc.find("p")
+            d["description"] = p.get_text(separator="\n", strip=True) if p else ""
 
-    return data
+        d["raw_images"] = [
+            img.get("src", "")
+            for img in soup.select(".picturesGallery img")
+            if "mubawab-media" in img.get("src", "")
+        ]
+
+    # Location text
+    loc = soup.find("h3", class_="greyTit")
+    if loc:
+        d["location_text"] = loc.get_text(strip=True)
+
+    # Coordinates
+    lat = soup.find("input", {"id": "latField"})
+    lng = soup.find("input", {"id": "lngField"})
+    if lat and lng:
+        try:
+            d["latitude"]  = float(lat["value"])
+            d["longitude"] = float(lng["value"])
+        except (ValueError, KeyError):
+            pass
+
+    # Property type from main features
+    for blk in soup.select(".adMainFeature"):
+        lbl = blk.select_one(".adMainFeatureContentLabel")
+        val = blk.select_one(".adMainFeatureContentValue")
+        if lbl and val and re.search(r"Type de bien|نوع العقار", lbl.get_text()):
+            d["property_type"] = val.get_text(strip=True)
+            break
+
+    # Feature lists
+    d["features"] = [
+        f.get_text(strip=True) for f in soup.select(".adFeature .fSize11")
+        if f.get_text(strip=True)
+    ]
+    d["main_features"] = {}
+    for blk in soup.select(".adMainFeature"):
+        lbl = blk.select_one(".adMainFeatureContentLabel")
+        val = blk.select_one(".adMainFeatureContentValue")
+        if lbl and val:
+            d["main_features"][lbl.get_text(strip=True).rstrip(":")] = val.get_text(strip=True)
+
+    return d
 
 
-def extract_features(soup):
-    features = []
-    for feat in soup.select(".adFeature .fSize11"):
-        txt = feat.get_text(strip=True)
-        if txt:
-            features.append(txt)
-    return features
+# ══════════════════════════════════════════════════════════════════
+# PHONE EXTRACTION
+# ══════════════════════════════════════════════════════════════════
 
-
-def extract_main_features(soup):
-    main_feats = {}
-    for feat_block in soup.select(".adMainFeature"):
-        label_el = feat_block.select_one(".adMainFeatureContentLabel")
-        value_el = feat_block.select_one(".adMainFeatureContentValue")
-        if label_el and value_el:
-            key = label_el.get_text(strip=True).rstrip(":")
-            val = value_el.get_text(strip=True)
-            main_feats[key] = val
-    return main_feats
-
-
-def extract_property_type(soup):
-    for feat_block in soup.select(".adMainFeature"):
-        label_el = feat_block.select_one(".adMainFeatureContentLabel")
-        value_el = feat_block.select_one(".adMainFeatureContentValue")
-        if label_el and "Type de bien" in label_el.get_text():
-            return value_el.get_text(strip=True) if value_el else None
+def get_phone(session, ad_id, referer_url):
+    """Click 'Appeler' equivalent — POST to Mubawab's phone AJAX endpoint."""
+    try:
+        resp = session.post(
+            "https://www.mubawab.tn/fr/ajax/getphone.html",
+            data={"adId": ad_id},
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": referer_url,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://www.mubawab.tn",
+            },
+            timeout=10,
+        )
+        if resp.ok:
+            try:
+                data = resp.json()
+                phone = (data.get("phone") or data.get("telephone")
+                         or data.get("phoneNumber") or data.get("sellerPhone"))
+                if phone:
+                    return str(phone).strip()
+            except json.JSONDecodeError:
+                text = resp.text.strip()
+                m = re.search(r"\+?[\d\s\-\.]{8,}", text)
+                if m:
+                    return m.group(0).strip()
+    except Exception as e:
+        log.debug(f"[ad {ad_id}] Phone AJAX failed: {e}")
     return None
 
 
-# ─── Scraping principal ──────────────────────────────────────────
-def scrape_all():
-    collection = get_collection()
-    all_links = []
-    page = 1
-    consecutive_no_new = 0
+# ══════════════════════════════════════════════════════════════════
+# COMBINED DETAIL SCRAPE (FR + AR)
+# ══════════════════════════════════════════════════════════════════
 
-    print(f"🔍 Début du scraping de Mubawab.tn - Locations")
-    print(f"   URL de base: {LISTING_URL}")
-    print(f"   Max pages: {MAX_PAGES}\n")
+def scrape_listing(session, ad_id, fr_url, ar_url):
+    """Fetch FR and AR detail pages, merge into one document."""
+    now = datetime.now(timezone.utc)
+    doc = {"ad_id": ad_id, "scraped_at": now}
+    raw_images = []
 
-    while page <= MAX_PAGES:
-        page_url = get_page_url(LISTING_URL, page)
-        print(f"📄 Page {page}: {page_url}")
+    # ── French detail page ─────────────────────────────────────────
+    try:
+        resp = session.get(fr_url, headers=HEADERS_FR, timeout=15)
+        resp.raise_for_status()
+        doc["url_fr"] = resp.url  # after redirect
+        fr = parse_detail_page(BeautifulSoup(resp.text, "html.parser"))
 
+        # Shared numeric/geo fields from FR (primary source)
+        for f in ("price", "currency", "rooms", "bedrooms", "bathrooms",
+                  "area_m2", "country", "latitude", "longitude"):
+            if fr.get(f) is not None:
+                doc[f] = fr[f]
+
+        doc["title_fr"]         = fr.get("title", "")
+        doc["description_fr"]   = fr.get("description", "")
+        doc["city_fr"]          = fr.get("city", "")
+        doc["location_text_fr"] = fr.get("location_text", "")
+        doc["property_type_fr"] = fr.get("property_type")
+        doc["features_fr"]      = fr.get("features", [])
+        doc["main_features_fr"] = fr.get("main_features", {})
+        doc["seller_name"]      = fr.get("seller_name", "")
+        doc["seller_type"]      = fr.get("seller_type", "")
+
+        raw_images = fr.get("raw_images", [])
+
+        # Phone from JSON-LD (if present)
+        if fr.get("phone_ld"):
+            doc["phone"] = fr["phone_ld"]
+
+    except Exception as e:
+        log.warning(f"[ad {ad_id}] FR detail error: {e}")
+
+    # ── Arabic detail page ─────────────────────────────────────────
+    try:
+        resp_ar = session.get(ar_url, headers=HEADERS_AR, timeout=15)
+        resp_ar.raise_for_status()
+        doc["url_ar"] = resp_ar.url
+        ar = parse_detail_page(BeautifulSoup(resp_ar.text, "html.parser"))
+
+        doc["title_ar"]         = ar.get("title", "")
+        doc["description_ar"]   = ar.get("description", "")
+        doc["city_ar"]          = ar.get("city", "")
+        doc["location_text_ar"] = ar.get("location_text", "")
+        doc["property_type_ar"] = ar.get("property_type")
+        doc["features_ar"]      = ar.get("features", [])
+        doc["main_features_ar"] = ar.get("main_features", {})
+
+        # Coordinates fallback
+        if not doc.get("latitude") and ar.get("latitude"):
+            doc["latitude"]  = ar["latitude"]
+            doc["longitude"] = ar["longitude"]
+
+    except Exception as e:
+        log.debug(f"[ad {ad_id}] AR detail error: {e}")
+
+    # ── Phone via AJAX (if not already found) ─────────────────────
+    if not doc.get("phone"):
+        phone = get_phone(session, ad_id, doc.get("url_fr", fr_url))
+        if phone:
+            doc["phone"] = phone
+
+    # ── Images → B2 ───────────────────────────────────────────────
+    if raw_images:
+        doc["images"]      = upload_images("mubawab", ad_id, raw_images)
+        doc["image_count"] = len(doc["images"])
+
+    return doc
+
+
+# ══════════════════════════════════════════════════════════════════
+# ZONE SCRAPING
+# ══════════════════════════════════════════════════════════════════
+
+def discover_zone(session, zone_name, fr_search, ar_search):
+    """Return {ad_id: (fr_url, ar_url)} for all listings in a zone."""
+    all_ids  = set()
+    fr_urls  = {}
+    ar_urls  = {}
+
+    for lang, search_url in (("fr", fr_search), ("ar", ar_search)):
+        consecutive_empty = 0
+        for page in range(1, MAX_PAGES + 1):
+            page_url = get_page_url(search_url, page)
+            try:
+                ids, fr, ar = get_ids_from_page(session, page_url, lang)
+                if not ids:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 3:
+                        break
+                    time.sleep(DELAY)
+                    continue
+
+                consecutive_empty = 0
+                new = ids - all_ids
+                all_ids |= ids
+                fr_urls.update(fr)
+                ar_urls.update(ar)
+
+                if new:
+                    print(f"    {lang.upper()} p{page}: {len(new)} nouvelles ({len(all_ids)} total)")
+
+            except Exception as e:
+                log.warning(f"  [{zone_name}] {lang.upper()} p{page} error: {e}")
+
+            time.sleep(DELAY)
+
+    return all_ids, fr_urls, ar_urls
+
+
+def scrape_zone(session, collection, zone_name, fr_search, ar_search):
+    print(f"\n{'─'*60}")
+    print(f"  Zone: {zone_name}")
+
+    all_ids, fr_urls, ar_urls = discover_zone(session, zone_name, fr_search, ar_search)
+    print(f"  Découverts: {len(all_ids)}")
+
+    # Skip already in DB
+    existing = {
+        doc["ad_id"]
+        for doc in collection.find(
+            {"ad_id": {"$in": list(all_ids)}}, {"ad_id": 1, "_id": 0}
+        )
+    }
+    new_ids = all_ids - existing
+    print(f"  Nouveaux: {len(new_ids)}\n")
+
+    success = errors = 0
+    for i, ad_id in enumerate(sorted(new_ids), 1):
+        fr_url = fr_urls.get(ad_id) or f"https://www.mubawab.tn/fr/pa/{ad_id}/"
+        ar_url = ar_urls.get(ad_id) or fr_url.replace("/fr/pa/", "/ar/pa/")
+
+        print(f"  [{i}/{len(new_ids)}] ad {ad_id}")
         try:
-            links = get_ad_links_from_listing(page_url)
-            if not links:
-                print(f"   ❌ Aucune annonce trouvée, fin de la pagination.")
-                break
-
-            new_links = []
-            for link in links:
-                ad_id = extract_id_from_url(link)
-                if ad_id and not collection.find_one({"ad_id": ad_id}):
-                    new_links.append(link)
-
-            print(f"   ✅ {len(links)} annonces trouvées, {len(new_links)} nouvelles")
-            all_links.extend(new_links)
-
-            if len(new_links) == 0:
-                consecutive_no_new += 1
-                if consecutive_no_new >= 3:
-                    print(f"   ⏹️  3 pages consécutives sans nouvelles annonces, arrêt.")
-                    break
-            else:
-                consecutive_no_new = 0
-
-        except Exception as e:
-            print(f"   ⚠️  Erreur page {page}: {e}")
-
-        page += 1
-        time.sleep(DELAY_BETWEEN_REQUESTS)
-
-    all_links = list(dict.fromkeys(all_links))
-    print(f"\n📊 Total annonces à scraper: {len(all_links)}\n")
-
-    success = 0
-    errors = 0
-
-    for i, link in enumerate(all_links, 1):
-        print(f"  [{i}/{len(all_links)}] {unquote(link[:80])}...")
-
-        try:
-            ad_data = parse_ad_page(link)
+            doc = scrape_listing(session, ad_id, fr_url, ar_url)
+            doc["zone"] = zone_name
+            now = datetime.now(timezone.utc)
 
             collection.update_one(
-                {"ad_id": ad_data["ad_id"]},
-                {"$set": ad_data},
-                upsert=True
+                {"ad_id": ad_id},
+                {
+                    "$set":         {k: v for k, v in doc.items() if k != "first_seen"},
+                    "$setOnInsert": {"first_seen": now},
+                },
+                upsert=True,
             )
             success += 1
-            print(f"    ✅ {ad_data.get('title', '')[:50]} - {ad_data.get('price')} TND")
+            title = doc.get("title_fr") or doc.get("title_ar") or ""
+            print(f"    ✅ {title[:60]}")
 
         except Exception as e:
             errors += 1
-            print(f"    ❌ Erreur: {e}")
+            log.warning(f"    ❌ ad {ad_id}: {e}")
 
-        time.sleep(DELAY_BETWEEN_REQUESTS)
+        time.sleep(DELAY)
 
-    print(f"\n{'='*50}")
-    print(f"✅ Scraping terminé!")
-    print(f"   Succès:  {success}")
-    print(f"   Erreurs: {errors}")
-    print(f"   Total en base: {collection.count_documents({})}")
-    print(f"{'='*50}")
+    return success, errors
+
+
+# ══════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════
+
+def scrape_all():
+    print("\n" + "=" * 60)
+    print("  MUBAWAB SCRAPER — Locations FR + AR")
+    print("=" * 60)
+    check_b2()
+    print()
+
+    collection = get_collection()
+    session    = requests.Session()
+
+    total_success = total_errors = 0
+    for zone_name, fr_url, ar_url in ZONES:
+        s, e = scrape_zone(session, collection, zone_name, fr_url, ar_url)
+        total_success += s
+        total_errors  += e
+
+    print(f"\n{'='*60}")
+    print(f"  ✅ Succès:  {total_success}")
+    print(f"  ❌ Erreurs: {total_errors}")
+    print(f"  Total en base: {collection.count_documents({})}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
