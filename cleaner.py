@@ -36,11 +36,11 @@ CLEAN_COLLECTION  = os.getenv("MONGO_MUBAWAB_COL_CLEAN", "locations_clean")
 BATCH_SIZE        = int(os.getenv("BATCH_SIZE", "500"))
 
 # TND monthly rent thresholds
-MIN_PRICE   = 100
-MAX_PRICE   = 50_000
-MIN_SURFACE = 10
-MAX_SURFACE = 1_500
-MAX_ROOMS   = 20
+# Upper bounds removed — commercial properties (warehouses, factories) have
+# legitimately large surfaces and high rents
+MIN_PRICE   = 50
+MIN_SURFACE = 5
+MAX_ROOMS   = 50
 
 # ============================================================
 # CLEANING HELPERS
@@ -71,26 +71,38 @@ def parse_surface(raw) -> float | None:
 
 
 def clean_description(raw: str | None) -> str | None:
-    """Strip HTML, decode entities, normalize accents."""
+    """Strip HTML tags and normalize whitespace. Preserves Arabic and other Unicode text."""
     if not raw:
         return None
     text = re.sub(r"<[^>]+>", " ", raw)
     text = html.unescape(text)
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    # Normalize whitespace only — do NOT encode to ASCII (would destroy Arabic)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.strip()
-    return text if len(text) > 20 else None
+    return text if len(text) > 10 else None
 
 
 def normalize_property_type(raw: str | None) -> str | None:
     if not raw:
         return None
-    raw_lower = raw.lower()
-    if any(w in raw_lower for w in ("appartement", "studio", "duplex", "flat")):
+    r = raw.lower()
+    if any(w in r for w in ("appartement", "studio", "duplex", "flat", "شقة", "شقق")):
         return "apartment"
-    if any(w in raw_lower for w in ("maison", "villa", "house")):
+    if any(w in r for w in ("maison", "house", "منزل", "بيت", "بيوت")):
         return "house"
+    if any(w in r for w in ("villa", "فيلا", "فيلات")):
+        return "villa"
+    if any(w in r for w in ("chambre", "room", "غرفة", "غرف")):
+        return "room"
+    if any(w in r for w in ("bureau", "office", "مكتب", "مكاتب")):
+        return "office"
+    if any(w in r for w in ("local commercial", "commerce", "retail", "محل", "محلات")):
+        return "commercial"
+    if any(w in r for w in ("ferme", "farm", "ضيعة", "ضيعات")):
+        return "farm"
+    if any(w in r for w in ("entrepôt", "warehouse", "مستودع")):
+        return "warehouse"
     return raw
 
 
@@ -103,11 +115,17 @@ def clean_document(doc: dict) -> dict:
     c["country"]          = "TN"
     c["transaction_type"] = "rent"
 
-    c["url"] = doc.get("url")
+    # URLs (old scraper: "url"; new scraper: "url_fr" + "url_ar")
+    c["url"]    = doc.get("url_fr") or doc.get("url")
+    c["url_ar"] = doc.get("url_ar") or None
 
-    c["property_type"] = normalize_property_type(doc.get("property_type"))
+    # Property type — prefer FR, fallback to AR
+    raw_type = doc.get("property_type_fr") or doc.get("property_type") or doc.get("property_type_ar")
+    c["property_type"] = normalize_property_type(raw_type)
 
-    c["city"] = doc.get("city") or None
+    # City — prefer FR, fallback to AR
+    c["city"]    = doc.get("city_fr") or doc.get("city") or None
+    c["city_ar"] = doc.get("city_ar") or None
 
     price = parse_price(doc.get("price"))
     c["price"]    = price
@@ -131,8 +149,16 @@ def clean_document(doc: dict) -> dict:
         except (TypeError, ValueError):
             pass
 
-    c["description"] = clean_description(doc.get("description"))
-    c["title"]       = doc.get("title") or None
+    # Title — bilingual (new scraper) or single (old scraper)
+    c["title"]    = doc.get("title_fr") or doc.get("title") or None
+    c["title_ar"] = doc.get("title_ar") or None
+
+    # Description — bilingual (new) or single (old)
+    c["description"]    = clean_description(doc.get("description_fr") or doc.get("description"))
+    c["description_ar"] = clean_description(doc.get("description_ar"))
+
+    # Phone (new scraper)
+    c["phone"] = doc.get("phone") or None
 
     images = doc.get("images")
     if isinstance(images, list):
@@ -144,9 +170,13 @@ def clean_document(doc: dict) -> dict:
 
     c["agency_name"] = doc.get("seller_name") or None
 
-    feats = doc.get("features")
-    if isinstance(feats, list) and feats:
-        c["features"] = feats
+    # Features — bilingual
+    feats_fr = doc.get("features_fr") or doc.get("features")
+    feats_ar = doc.get("features_ar")
+    if isinstance(feats_fr, list) and feats_fr:
+        c["features"] = feats_fr
+    if isinstance(feats_ar, list) and feats_ar:
+        c["features_ar"] = feats_ar
 
     if price and surface and surface > 0:
         c["price_per_m2"] = round(price / surface, 2)
@@ -163,19 +193,22 @@ def clean_document(doc: dict) -> dict:
 # VALIDATION
 # ============================================================
 
+EXCLUDED_TYPES = {"garage", "parking", "land"}
+
+
 def validate(doc: dict) -> tuple[bool, str | None]:
+    if doc.get("property_type") in EXCLUDED_TYPES:
+        return False, "excluded_type"
+
     price = doc.get("price")
-    if not price or price < MIN_PRICE or price > MAX_PRICE:
+    if not price or price < MIN_PRICE:
         return False, "invalid_price"
 
     if not doc.get("source_id"):
         return False, "missing_source_id"
 
-    if not doc.get("city"):
-        return False, "missing_city"
-
     surface = doc.get("surface_m2")
-    if surface and (surface < MIN_SURFACE or surface > MAX_SURFACE):
+    if surface and surface < MIN_SURFACE:
         return False, "invalid_surface"
 
     rooms = doc.get("bedrooms")
@@ -253,8 +286,8 @@ def run(source_col, clean_col, dry_run=False):
 
     stats = {
         "cleaned": 0, "inserted": 0, "updated": 0,
-        "invalid_price": 0, "missing_source_id": 0, "missing_city": 0,
-        "invalid_surface": 0, "aberrant_rooms": 0, "errors": 0,
+        "invalid_price": 0, "missing_source_id": 0,
+        "invalid_surface": 0, "aberrant_rooms": 0, "excluded_type": 0, "errors": 0,
     }
 
     batch = []
@@ -309,7 +342,7 @@ def print_stats(s, dry_run=False):
     rejected = s["cleaned"] - s["inserted"] - s["updated"]
     if rejected > 0:
         print(f"   Rejected:   {rejected}")
-        for k in ("invalid_price", "missing_source_id", "missing_city", "invalid_surface", "aberrant_rooms"):
+        for k in ("invalid_price", "missing_source_id", "invalid_surface", "aberrant_rooms", "excluded_type"):
             if s.get(k):
                 print(f"      {k}: {s[k]}")
     if s["errors"]:

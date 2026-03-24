@@ -60,6 +60,25 @@ def _public_url(key):
     return f"{B2_ENDPOINT}/{B2_BUCKET}/{key}"
 
 
+def check_b2():
+    """Print B2 configuration status. Call at startup."""
+    if not _b2_configured():
+        print("⚠️  B2 NOT configured — B2_KEY_ID or B2_APPLICATION_KEY missing. Images will use original URLs.")
+        return False
+    print(f"✅ B2 configured — bucket: {B2_BUCKET} | endpoint: {B2_ENDPOINT}")
+    try:
+        _get_s3().head_bucket(Bucket=B2_BUCKET)
+        print(f"✅ B2 bucket '{B2_BUCKET}' reachable")
+        return True
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        print(f"❌ B2 bucket error [{code}]: {e} — check bucket name and permissions")
+        return False
+    except Exception as e:
+        print(f"❌ B2 connection error: {e}")
+        return False
+
+
 def upload_image(source, ad_id, img_url, index=0, timeout=20):
     """Upload one image to B2. Returns B2 URL or original URL on failure."""
     if not _b2_configured() or not img_url:
